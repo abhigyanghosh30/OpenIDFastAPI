@@ -1,6 +1,6 @@
 # OpenIDFastAPI
 
-A simple webapp for testing the feasibility to
+A simple webapp for testing the feasibility for integrating OpenID with FastAPI
 
 ## Installation
 
