@@ -1,53 +1,121 @@
-import sqlite3
 import uvicorn
-from fastapi import FastAPI, Response, Depends, Request
+from pydantic import BaseModel
+from uuid import UUID, uuid4
+
+from fastapi import Depends, FastAPI, Response, Request, HTTPException
 from fastapi.responses import RedirectResponse
-from starlette.middleware.sessions import SessionMiddleware
+
+from fastapi_sessions.frontends.implementations import (
+    SessionCookie,
+    CookieParameters,
+)
+from fastapi_sessions.backends.implementations import InMemoryBackend
+from fastapi_sessions.session_verifier import SessionVerifier
+
 from openid.extensions import sreg, pape
 from openid.consumer import consumer
-from openid.store.sqlstore import SQLiteStore
+from openid.store.filestore import FileOpenIDStore
 from openid.store.nonce import mkNonce
-from uuid import uuid4
+
 
 SESSION_COOKIE_NAME = "pyoidconsexsid"
 sessions = {}
-SESSION = None
 
-app = FastAPI()
-app.add_middleware(SessionMiddleware, secret_key="some-random-string")
 
+class SessionData(BaseModel):
+    username: str
+    email: str
+    fullname: str
+
+
+cookie_params = CookieParameters()
+
+# Uses UUID
+cookie = SessionCookie(
+    cookie_name="cookie",
+    identifier="general_verifier",
+    auto_error=True,
+    secret_key="DONOTUSE",
+    cookie_params=cookie_params,
+)
+
+backend = InMemoryBackend[UUID, SessionData]()
+
+
+class BasicVerifier(SessionVerifier[UUID, SessionData]):
+    def __init__(
+        self,
+        *,
+        identifier: str,
+        auto_error: bool,
+        backend: InMemoryBackend[UUID, SessionData],
+        auth_http_exception: HTTPException,
+    ):
+        self._identifier = identifier
+        self._auto_error = auto_error
+        self._backend = backend
+        self._auth_http_exception = auth_http_exception
+
+    @property
+    def identifier(self):
+        return self._identifier
+
+    @property
+    def backend(self):
+        return self._backend
+
+    @property
+    def auto_error(self):
+        return self._auto_error
+
+    @property
+    def auth_http_exception(self):
+        return self._auth_http_exception
+
+    def verify_session(self, model: SessionData) -> bool:
+        """If the session exists, it is valid"""
+        return True
+
+
+verifier = BasicVerifier(
+    identifier="general_verifier",
+    auto_error=True,
+    backend=backend,
+    auth_http_exception=HTTPException(
+        status_code=403, detail="invalid session"
+    ),
+)
 
 OPENID_PROVIDER_URL = "https://login.ubuntu.com"
-conn = sqlite3.connect('sql.db',check_same_thread=False)
 
-def getConsumer(request: Request):
-    store = SQLiteStore(conn)
-    return consumer.Consumer(getSession(request), store)
+app = FastAPI()
 
 
-def getSession(request: Request):
-    global SESSION
-    """Return the existing session or a new session"""
-    if SESSION is not None:
-        return SESSION
+async def getConsumer(request: Request):
+    store = FileOpenIDStore("/tmp/openid-filestore")
+    session = await getSession(request)
+    return consumer.Consumer(session, store)
 
+
+async def getSession(request: Request):
     # Get value of cookie header that was sent
     sid = request.cookies.get(SESSION_COOKIE_NAME, None)
     # If a session id was not set, create a new one
     if sid is None:
         # Pure pragmatism: Use function for nonce salt to generate session ID.
-        sid = mkNonce(16)
-        SESSION = None
-    else:
-        SESSION = sessions[sid]
+        sid = uuid4()
+        data = SessionData(username="", email="", fullname="")
+        await backend.create(sid, data)
 
-    # If no session exists for this session ID, create one
-    if SESSION is None:
-        sessions[sid] = {}
-        SESSION = {}
+    session = await backend.read(sid)
 
-    SESSION["id"] = sid
-    return SESSION
+    return {
+        "username": session.username,
+        "fullname": session.fullname,
+        "email": session.email,
+        "id": sid,
+    }
+
 
 def setSessionCookie(self):
     sid = self.getSession()["id"]
@@ -58,7 +126,7 @@ def setSessionCookie(self):
 @app.get("/login")
 async def login():
     sreg_req = sreg.SRegRequest(
-        ["email","nickname"],
+        ["email", "nickname"],
         ["fullname"],
     )
     href = sreg_req.toMessage().toURL(OPENID_PROVIDER_URL)
@@ -66,8 +134,8 @@ async def login():
 
 
 @app.get("/process")
-def process(request: Request):
-    oidconsumer = getConsumer(request)
+async def process(request: Request, response: Response):
+    oidconsumer = await getConsumer(request)
     print(oidconsumer)
     url = "http://" + request.headers.get("Host") + "/process"
     info = oidconsumer.complete(request.query_params, url)
@@ -79,13 +147,20 @@ def process(request: Request):
 
     elif info.status == consumer.SUCCESS:
         sreg_resp = sreg.SRegResponse.fromSuccessResponse(info)
-        pape_resp = pape.Response.fromSuccessResponse(info)
-        SESSION["username"] = sreg_resp.get("nickname")
-        return {"success": "VERIFIED","username":SESSION["username"]}
+        username = sreg_resp.get("nickname")
+        fullname = sreg_resp.get("fullname")
+        email = sreg_resp.get("email")
+        sid = uuid4()
+        data = SessionData(username=username, email=email, fullname=fullname)
+        await backend.create(sid, data)
+        cookie.attach_to_response(response, sid)
+
+        return {"success": "VERIFIED", "username": username}
+
 
 @app.get("/verify")
-def verify(request:Request, response: Response):
-    oidconsumer = getConsumer(request)
+async def verify(request: Request, response: Response):
+    oidconsumer = await getConsumer(request)
     try:
         oid_request = oidconsumer.begin(OPENID_PROVIDER_URL)
     except consumer.DiscoveryFailure as exc:
@@ -97,22 +172,23 @@ def verify(request:Request, response: Response):
             return {"error": "None"}
         else:
             sreg_request = sreg.SRegRequest(
-                required=["email","nickname"], optional=["fullname"],
-
+                required=["email", "nickname"],
+                optional=["fullname"],
             )
             pape_request = pape.Request([pape.AUTH_PHISHING_RESISTANT])
             oid_request.addExtension(sreg_request)
             oid_request.addExtension(pape_request)
-            redirect_url = oid_request.redirectURL("http://0.0.0.0:8000","http://0.0.0.0:8000/process")
-            
+            redirect_url = oid_request.redirectURL(
+                "http://0.0.0.0:8000", "http://0.0.0.0:8000/process"
+            )
+
             return RedirectResponse(redirect_url)
 
-@app.get("/user")
-def user():
-    if SESSION is not None:
-        return {"username":SESSION["username"]}
-    else:
-        return RedirectResponse("/verify")
+
+@app.get("/user", dependencies=[Depends(cookie)])
+def user(session_data: SessionData = Depends(verifier)):
+    return session_data
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
