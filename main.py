@@ -79,7 +79,7 @@ class BasicVerifier(SessionVerifier[UUID, SessionData]):
 
 verifier = BasicVerifier(
     identifier="general_verifier",
-    auto_error=True,
+    auto_error=False,
     backend=backend,
     auth_http_exception=HTTPException(
         status_code=403, detail="invalid session"
@@ -123,16 +123,6 @@ def setSessionCookie(self):
     self.send_header("Set-Cookie", session_cookie)
 
 
-@app.get("/login")
-async def login():
-    sreg_req = sreg.SRegRequest(
-        ["email", "nickname"],
-        ["fullname"],
-    )
-    href = sreg_req.toMessage().toURL(OPENID_PROVIDER_URL)
-    return {"href": href}
-
-
 @app.get("/process")
 async def process(request: Request, response: Response):
     oidconsumer = await getConsumer(request)
@@ -155,6 +145,10 @@ async def process(request: Request, response: Response):
         await backend.create(sid, data)
         cookie.attach_to_response(response, sid)
 
+        if request.query_params.get("return_url"):
+            resp = RedirectResponse(request.query_params.get("return_url"))
+            cookie.attach_to_response(resp, sid)
+            return resp
         return {"success": "VERIFIED", "username": username}
 
 
@@ -175,11 +169,16 @@ async def verify(request: Request, response: Response):
                 required=["email", "nickname"],
                 optional=["fullname"],
             )
+            return_url_arg = request.query_params.get("return_url")
+            return_url = ""
+            if return_url_arg is not None:
+                return_url = "?return_url=" + return_url_arg
             pape_request = pape.Request([pape.AUTH_PHISHING_RESISTANT])
             oid_request.addExtension(sreg_request)
             oid_request.addExtension(pape_request)
             redirect_url = oid_request.redirectURL(
-                "http://0.0.0.0:8000", "http://0.0.0.0:8000/process"
+                "http://0.0.0.0:8000",
+                "http://0.0.0.0:8000/process" + return_url,
             )
 
             return RedirectResponse(redirect_url)
@@ -187,7 +186,9 @@ async def verify(request: Request, response: Response):
 
 @app.get("/user", dependencies=[Depends(cookie)])
 def user(session_data: SessionData = Depends(verifier)):
-    return session_data
+    if session_data is not None:
+        return session_data
+    return RedirectResponse("/verify?return_url=/user")
 
 
 if __name__ == "__main__":
